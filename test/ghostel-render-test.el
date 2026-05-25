@@ -1363,6 +1363,62 @@ buffer."
               (should-not (string-match-p "early-" content)))))
       (kill-buffer buf))))
 
+(ert-deftest ghostel-test-osc8-flood-survives-page-swap ()
+  "Renderer survives ghostty's in-place page swap from `increaseCapacity'.
+
+Ghostty replaces a page node (new serial, cloned data) when any
+per-page capacity is exceeded — including `hyperlink_bytes', whose
+default budget holds only 4 OSC 8 hyperlinks.  Without serial
+reconciliation, `getOrAddLastPage' allocates a fresh
+`MaterializedPage{char_len=0}' for the new serial while the Emacs
+buffer still holds rows whose char count was tracked under the old
+entry, and the first row-overwrite underflows
+`page.char_len -= old_line_len'.
+
+This test:
+  1. Materializes a small page (so `pages_in_buffer' is non-empty).
+  2. Floods OSC 8 hyperlinks on fresh rows to force `increaseCapacity'.
+  3. Moves the cursor back and overwrites a row, so the renderer
+     hits the dirty-row delete-then-insert branch on the swapped page.
+
+Under Debug builds the bug panics on integer overflow; under release
+it silently wraps `char_len' to ~2^64 and corrupts subsequent ops.
+The assertion that the buffer ends up with the intended content
+catches both."
+  :tags '(native)
+  (let ((buf (generate-new-buffer " *ghostel-test-page-swap*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (let* ((term (ghostel--new 5 40 1000))
+                 (inhibit-read-only t))
+            ;; (1) Establish a materialized page via an incremental redraw
+            ;;     (force_full=nil — the path that uses reconcilePageSerials).
+            (ghostel--write-input term "row0\r\n")
+            (ghostel--redraw term)
+            ;; (2) Flood OSC 8 hyperlinks — well past the 4-link default
+            ;;     budget, so ghostty grows hyperlink_bytes at least once.
+            ;;     Each `increaseCapacity' destroys the current page node
+            ;;     and inserts a fresh one with a new serial.
+            (dotimes (i 12)
+              (ghostel--write-input
+               term
+               (format "\e]8;id=L%d;https://example.com/%d\e\\link%d\e]8;;\e\\\r\n"
+                       i i i)))
+            (ghostel--redraw term)
+            ;; (3) Overwrite an existing row.  CSI H homes to 1;1; cursor-down
+            ;;     + erase-line + new content overwrites a row that now lives
+            ;;     on a page whose serial differs from the one the renderer
+            ;;     last saw — the dirty-row delete-then-insert branch is the
+            ;;     site of the underflow without the fix.
+            (ghostel--write-input term "\e[H\e[2B\e[KAFTER\r\n")
+            (ghostel--redraw term)
+            ;; The buffer must contain the post-overwrite text.  Without
+            ;; the fix the underflowed bookkeeping mangles deletions and
+            ;; the assertion fails (release) or the redraw panics (Debug).
+            (let ((content (buffer-substring-no-properties (point-min) (point-max))))
+              (should (string-match-p "AFTER" content)))))
+      (kill-buffer buf))))
+
 (ert-deftest ghostel-test-scrollback-eviction-bulk ()
   "Scrollback eviction works for a single large bulk write.
 Writes a small batch, renders, then writes a massive amount in one go

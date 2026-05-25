@@ -150,6 +150,11 @@ pub fn redraw(self: *Self, alloc: Allocator, env: emacs.Env, force_full_arg: boo
         scrollback_cleared)
     {
         try self.clear(alloc, env);
+    } else {
+        // Reconcile our `pages_in_buffer' bookkeeping with ghostty's
+        // current page list before the row loop runs.  See the function
+        // docstring for why this is necessary.
+        self.reconcilePageSerials();
     }
 
     self.evictScrollback(alloc, env);
@@ -747,6 +752,40 @@ fn getOrAddLastPage(self: *Self, alloc: Allocator, serial: PageSerial) !*Materia
     page.* = .{ .serial = serial };
     self.pages_in_buffer.append(&page.node);
     return page;
+}
+
+/// Sync `MaterializedPage` serials with ghostty's current page list.
+///
+/// Background: every `MaterializedPage` tracks a ghostty page by its
+/// `serial`, but ghostty can replace a page node in-place — e.g.
+/// `PageList.increaseCapacity` destroys the old node and inserts a new
+/// one with the cloned data and a *new* serial.  After such a swap,
+/// `getOrAddLastPage` no longer finds the previous serial and creates
+/// a fresh `MaterializedPage{ .char_len = 0, .rows = 0 }`, while the
+/// Emacs buffer still holds the rows the old entry was tracking.  The
+/// first row-overwrite then evaluates `page.char_len -= old_line_len`
+/// against `char_len = 0` and underflows — Debug builds panic, release
+/// builds wrap to `~2^64` and corrupt the buffer on subsequent ops.
+///
+/// In-place swaps preserve position in the page list, so we walk both
+/// lists from the *right* in lock-step and update mismatched serials.
+/// Walking from the right (newest) keeps the existing `evictScrollback`
+/// invariant intact: any orphans left over on the left after the walk
+/// represent left-side eviction and are still detected by serial
+/// mismatch at `pages_in_buffer.first` vs. ghostty's first page.
+fn reconcilePageSerials(self: *Self) void {
+    var our_n = self.pages_in_buffer.last;
+    var their_n = self.term.screens.active.pages.pages.last;
+    while (our_n != null and their_n != null) : ({
+        our_n = our_n.?.prev;
+        their_n = their_n.?.prev;
+    }) {
+        const our_page: *MaterializedPage = @fieldParentPtr("node", our_n.?);
+        const their_serial = their_n.?.serial;
+        if (our_page.serial != their_serial) {
+            our_page.serial = their_serial;
+        }
+    }
 }
 
 fn clear(self: *Self, alloc: Allocator, env: emacs.Env) !void {

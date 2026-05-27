@@ -408,12 +408,20 @@ pub const RowContent = struct {
     /// its character is non-space, or if its style has any non-default
     /// attribute (e.g. a colored background, underline, etc.), so visibly-
     /// styled blanks are preserved.
+    ///
+    /// `preserve_until_col` forces preservation of cells with column index
+    /// `< preserve_until_col` even when they would otherwise be trimmed.
+    /// The renderer passes the cursor column on the cursor's row so the
+    /// terminal cursor can land on its actual cell even when a TUI moves
+    /// the cursor via positioning sequences without writing intermediate
+    /// space cells (e.g. Bubbletea-style input prompts).
     pub fn build(
         self: *RowContent,
         alloc: Allocator,
         renderer: *Self,
         row: *const gt.RenderState.Row,
         adjustment_threshold: u32,
+        preserve_until_col: u16,
     ) !void {
         try self.clear();
 
@@ -469,8 +477,10 @@ pub const RowContent = struct {
             const last_run = &self.runs.items[self.runs.items.len - 1];
             last_run.end_char = self.char_len;
 
-            // We trim cells that neither have content nor styling
-            if (raw_cell.hasText() or last_run.props != null) {
+            // We trim cells that neither have content nor styling, unless
+            // they are within the caller-requested preservation range
+            // (e.g. cells the cursor needs to land on).
+            if (raw_cell.hasText() or last_run.props != null or col < preserve_until_col) {
                 trim_byte_len = self.text.items.len;
                 trim_char_len = self.char_len;
             }
@@ -606,13 +616,22 @@ fn adjustGlyph(
     _ = env.f("put-text-property", .{ start_val, end_val, s.display, display_spec });
 }
 
-/// Insert row text and apply property runs.
-fn insertRow(self: *Self, alloc: Allocator, env: emacs.Env, row: *const gt.RenderState.Row) !usize {
+/// Insert row text and apply property runs. `preserve_until_col` is
+/// forwarded to `RowContent.build` and is non-zero only for the row that
+/// currently holds the terminal cursor — see `render`.
+fn insertRow(
+    self: *Self,
+    alloc: Allocator,
+    env: emacs.Env,
+    row: *const gt.RenderState.Row,
+    preserve_until_col: u16,
+) !usize {
     try self.row.build(
         alloc,
         self,
         row,
         if (self.font_info) |f| f.coverage else std.math.maxInt(u32),
+        preserve_until_col,
     );
 
     const row_start = env.extractInteger(env.point());
@@ -683,7 +702,14 @@ pub fn render(
     self.term.screens.active.pages.scroll(.{ .pin = pin });
     try self.render_state.update(alloc, self.term);
 
-    if (self.render_state.dirty != .false) {
+    // Enter the render path when libghostty has dirty rows, OR when
+    // the cursor is visible in this viewport. The cursor-row rebuild
+    // inside the loop needs to run on every redraw so pure cursor
+    // movement (CUF, absolute positioning) that doesn't dirty any
+    // cells still extends the line up to the cursor column.
+    const cursor_in_view = self.render_state.cursor.viewport != null and
+        self.render_state.cursor.visible;
+    if (self.render_state.dirty != .false or cursor_in_view) {
         // Set buffer default face
         var fg_hex: [7]u8 = undefined;
         var bg_hex: [7]u8 = undefined;
@@ -697,6 +723,21 @@ pub fn render(
             else => 0,
         };
 
+        // If the cursor is inside the currently-rendered viewport and
+        // visible, the row it sits on must keep cells up to the cursor
+        // column intact even when they'd otherwise be trimmed as trailing
+        // blanks. This handles TUIs (e.g. Bubbletea-based) that advance
+        // the cursor with positioning sequences without writing
+        // intermediate space cells.
+        const cursor_preserve: ?struct { y: u16, x: u16 } =
+            if (self.render_state.cursor.viewport) |vp|
+                if (self.render_state.cursor.visible)
+                    .{ .y = vp.y, .x = vp.x }
+                else
+                    null
+            else
+                null;
+
         var i: usize = 0;
         const row_dirty = self.render_state.row_data.items(.dirty);
         while (i < self.render_state.rows) : ({
@@ -706,7 +747,14 @@ pub fn render(
         }) {
             if (i < skip) continue;
 
-            const dirty_row = self.render_state.dirty == .full or row_dirty[i];
+            // The cursor's row must rebuild every redraw so the
+            // preserve-up-to-cursor extension below applies even when
+            // the cursor moved without writing any cells (e.g. CUF
+            // `\e[C' from a TUI input prompt). libghostty only marks
+            // rows dirty when a cell changes, so pure cursor movement
+            // would otherwise skip this row.
+            const cursor_row = if (cursor_preserve) |cp| cp.y == i else false;
+            const dirty_row = self.render_state.dirty == .full or row_dirty[i] or cursor_row;
             // Only process dirty rows, or there's no existing row
             const eob = env.eobp();
             if (dirty_row or eob) {
@@ -732,7 +780,16 @@ pub fn render(
                     env.deleteRegion(old_line_start, old_line_end);
                 }
 
-                const line_char_len = try self.insertRow(alloc, env, &row);
+                // `cursor.x` cells are needed for the cursor to land at
+                // column cursor.x via `positionCursorByCell` (it walks
+                // cells 0..cursor.x-1 and advances point that many
+                // chars). For typed input that landed in real cells
+                // this is a no-op since those cells already have text.
+                const preserve_until_col: u16 = if (cursor_preserve) |cp|
+                    if (cp.y == i) cp.x else 0
+                else
+                    0;
+                const line_char_len = try self.insertRow(alloc, env, &row, preserve_until_col);
                 if (page) |p| p.char_len += line_char_len;
             } else {
                 _ = env.forwardLine(1);

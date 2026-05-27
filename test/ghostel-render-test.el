@@ -288,6 +288,68 @@ are retained — only unwritten padding cells are trimmed."
               (should (equal "$ " (car lines))))))
       (kill-buffer buf))))
 
+(ert-deftest ghostel-test-render-keeps-cursor-row-cells ()
+  "Cells the terminal cursor lands on are preserved past the trim point.
+TUIs like Bubbletea move the cursor with positioning sequences
+without writing intermediate space cells.  The renderer must keep
+the cursor row's cells 0..cursor.x-1 so the visible cursor can land
+at column cursor.x instead of being clipped to end-of-line."
+  :tags '(native)
+  (let ((buf (generate-new-buffer " *ghostel-test-cursor-trim*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (let* ((term (ghostel--new 3 40 100))
+                 (inhibit-read-only t))
+            ;; Write `>` then move the cursor to col 5 (1-indexed) =
+            ;; col 4 (0-indexed) without writing any cells between
+            ;; col 1 and col 4.
+            (ghostel--write-input term "\e[H\e[2J>\e[1;5H")
+            (ghostel--redraw term t)
+            (let* ((lines (split-string (buffer-substring-no-properties
+                                         (point-min) (point-max))
+                                        "\n"))
+                   (first-line (car lines)))
+              ;; The cursor row preserves cells 0..3, so the rendered
+              ;; line is exactly 4 chars: `>` plus three blanks.
+              (should (equal ">   " first-line))
+              (should (equal (car ghostel--cursor-pos) 4))
+              ;; The visible cursor (point) sits at column 4 on row 0.
+              (save-excursion
+                (goto-char ghostel--cursor-char-pos)
+                (should (= (current-column) 4))))
+            ;; Moving the cursor closer to the start shrinks the
+            ;; preserved range correspondingly.
+            (ghostel--write-input term "\e[H\e[2J>\e[1;3H")
+            (ghostel--redraw term t)
+            (let* ((lines (split-string (buffer-substring-no-properties
+                                         (point-min) (point-max))
+                                        "\n"))
+                   (first-line (car lines)))
+              (should (equal "> " first-line))
+              (should (equal (car ghostel--cursor-pos) 2))
+              (save-excursion
+                (goto-char ghostel--cursor-char-pos)
+                (should (= (current-column) 2))))
+            ;; A pure cursor-movement update (no cell writes) must
+            ;; still rebuild the cursor row and extend the line.
+            ;; Replays what `agy' emits when the user types a space:
+            ;; sync-output-wrapped CUF that advances the cursor
+            ;; without writing any cells.  libghostty only marks
+            ;; rows dirty when a cell changes, so a non-forced
+            ;; redraw would otherwise skip the row entirely.
+            (ghostel--write-input term "\e[?2026h\e[C\e[?2026l")
+            (ghostel--redraw term)
+            (let* ((lines (split-string (buffer-substring-no-properties
+                                         (point-min) (point-max))
+                                        "\n"))
+                   (first-line (car lines)))
+              (should (equal ">  " first-line))
+              (should (equal (car ghostel--cursor-pos) 3))
+              (save-excursion
+                (goto-char ghostel--cursor-char-pos)
+                (should (= (current-column) 3))))))
+      (kill-buffer buf))))
+
 (ert-deftest ghostel-test-soft-wrap-copy ()
   "Test that soft-wrapped newlines are filtered during copy."
   :tags '(native)
